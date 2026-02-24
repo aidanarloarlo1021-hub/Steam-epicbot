@@ -11,7 +11,7 @@ from pathlib import Path
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest
 from dotenv import load_dotenv
 
 # ====================================================
@@ -24,6 +24,8 @@ load_dotenv(dotenv_path=env_path)
 
 # Получаем токен из переменных окружения
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ID вашего основного канала - можно использовать числовой ID или юзернейм
+MAIN_CHANNEL_ID = "@GiveawaydogSteamEgs"  # замените на ваш канал
 
 # Проверяем, что токен загрузился
 if not TELEGRAM_BOT_TOKEN:
@@ -42,11 +44,13 @@ if os.path.exists('/app/data/users.json'):
     USERS_FILE = '/app/data/users.json'
     NOTIFIED_GAMES_FILE = '/app/data/notified_games.json'
     USER_SETTINGS_FILE = '/app/data/user_settings.json'
+    PENDING_USERS_FILE = '/app/data/pending_users.json'
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     USERS_FILE = os.path.join(SCRIPT_DIR, "users.json")
     NOTIFIED_GAMES_FILE = os.path.join(SCRIPT_DIR, "notified_games.json")
     USER_SETTINGS_FILE = os.path.join(SCRIPT_DIR, "user_settings.json")
+    PENDING_USERS_FILE = os.path.join(SCRIPT_DIR, "pending_users.json")
 
 # Интервал проверки (в секундах)
 CHECK_INTERVAL = 3600  # 1 час
@@ -55,6 +59,50 @@ CHECK_INTERVAL = 3600  # 1 час
 # =============================================================================
 # УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ И НАСТРОЙКАМИ
 # =============================================================================
+
+def load_pending_users():
+    """Загружает список пользователей, ожидающих подтверждения подписки"""
+    if os.path.exists(PENDING_USERS_FILE):
+        with open(PENDING_USERS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"pending": {}}
+
+
+def save_pending_users(pending_dict):
+    """Сохраняет список ожидающих пользователей"""
+    with open(PENDING_USERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(pending_dict, f, ensure_ascii=False, indent=2)
+
+
+def add_pending_user(chat_id, username=None, first_name=None):
+    """Добавляет пользователя в список ожидающих подтверждения"""
+    pending = load_pending_users()
+    if str(chat_id) not in pending["pending"]:
+        pending["pending"][str(chat_id)] = {
+            "username": username,
+            "first_name": first_name,
+            "timestamp": time.time()
+        }
+        save_pending_users(pending)
+        return True
+    return False
+
+
+def remove_pending_user(chat_id):
+    """Удаляет пользователя из списка ожидающих"""
+    pending = load_pending_users()
+    if str(chat_id) in pending["pending"]:
+        del pending["pending"][str(chat_id)]
+        save_pending_users(pending)
+        return True
+    return False
+
+
+def check_pending_user(chat_id):
+    """Проверяет, ожидает ли пользователь подтверждения"""
+    pending = load_pending_users()
+    return str(chat_id) in pending["pending"]
+
 
 def load_users():
     """Загружает подписанных пользователей из файла"""
@@ -77,6 +125,7 @@ def add_user(chat_id):
         users["users"].append(chat_id)
         save_users(users)
         init_user_settings(chat_id)
+        remove_pending_user(chat_id)
         return True
     return False
 
@@ -137,19 +186,70 @@ def get_user_setting(chat_id, key, default=None):
     return user_settings.get(key, default)
 
 
-def update_user_setting(chat_id, key, value):
-    """Обновляет настройку пользователя"""
-    settings = load_user_settings()
-    if str(chat_id) not in settings:
-        init_user_settings(chat_id)
-        settings = load_user_settings()
+# =============================================================================
+# ПРОВЕРКА ПОДПИСКИ НА КАНАЛ (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# =============================================================================
 
-    settings[str(chat_id)][key] = value
-    save_user_settings(settings)
+async def check_channel_subscription(bot, user_id, channel_id):
+    """Проверяет, подписан ли пользователь на канал"""
+    try:
+        print(f"🔍 Проверяю подписку пользователя {user_id} на канал {channel_id}")
+
+        # Пытаемся получить информацию о пользователе в канале
+        chat_member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+
+        # Статусы, которые считаются подпиской
+        valid_statuses = ['member', 'administrator', 'creator']
+
+        print(f"📊 Статус пользователя: {chat_member.status}")
+
+        return chat_member.status in valid_statuses
+
+    except BadRequest as e:
+        # Ошибка BadRequest может быть если бот не админ или канал не существует
+        print(f"❌ Ошибка BadRequest при проверке подписки: {e}")
+        if "chat not found" in str(e).lower():
+            print(f"⚠️ Канал {channel_id} не найден или бот не добавлен в канал!")
+        elif "user not found" in str(e).lower():
+            print(f"⚠️ Пользователь {user_id} не найден в канале")
+        return False
+    except Exception as e:
+        print(f"⚠️ Неожиданная ошибка при проверке подписки: {e}")
+        return False
 
 
 # =============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ДИАГНОСТИЧЕСКАЯ КОМАНДА ДЛЯ ПРОВЕРКИ ПОДПИСКИ
+# =============================================================================
+
+async def cmd_check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /checksub - проверить статус подписки (только для админа)"""
+    chat_id = update.effective_chat.id
+
+    if chat_id != YOUR_ADMIN_ID:
+        await update.message.reply_text("❌ У вас нет прав на эту команду")
+        return
+
+    # Проверяем для текущего пользователя
+    is_subscribed = await check_channel_subscription(context.bot, chat_id, MAIN_CHANNEL_ID)
+
+    status_text = "✅ Подписан" if is_subscribed else "❌ НЕ подписан"
+
+    await update.message.reply_text(
+        f"📊 <b>Диагностика подписки:</b>\n\n"
+        f"👤 Ваш ID: <code>{chat_id}</code>\n"
+        f"📢 Канал: {MAIN_CHANNEL_ID}\n"
+        f"📌 Статус: {status_text}\n\n"
+        f"<b>Проверьте:</b>\n"
+        f"1. Бот должен быть администратором канала\n"
+        f"2. Канал должен быть публичным или бот должен знать его ID\n"
+        f"3. Вы должны быть подписаны на канал",
+        parse_mode='HTML'
+    )
+
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений)
 # =============================================================================
 
 def load_notified_games():
@@ -178,7 +278,6 @@ def save_notified_games(games_dict):
         with open(NOTIFIED_GAMES_FILE, 'w', encoding='utf-8') as f:
             json.dump(games_dict, f, ensure_ascii=False, indent=2)
 
-        # Проверяем, что файл сохранился
         if os.path.exists(NOTIFIED_GAMES_FILE):
             size = os.path.getsize(NOTIFIED_GAMES_FILE)
             print(f"✅ Файл сохранен, размер: {size} байт")
@@ -214,7 +313,7 @@ def clean_old_games(games_dict, days=7):
 
 
 # =============================================================================
-# STEAM ФУНКЦИИ
+# STEAM ФУНКЦИИ (без изменений)
 # =============================================================================
 
 def is_game_free_to_play(app_id):
@@ -340,10 +439,10 @@ def check_steam_free_games():
 
 
 def check_steam_discounts():
-    """Проверяет игры со скидками в Steam (всегда ищет 90%+)"""
+    """Проверяет игры со скидками в Steam (всегда ищет 80%+)"""
     discounted_games = []
     found_ids = set()
-    min_discount = 90
+    min_discount = 80
 
     try:
         headers = {
@@ -351,7 +450,7 @@ def check_steam_discounts():
             'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
         }
 
-        print(f"\n🔍 ПРОВЕРКА СКИДОК STEAM (90%+)...")
+        print(f"\n🔍 ПРОВЕРКА СКИДОК STEAM (80%+)...")
 
         search_url = "https://store.steampowered.com/search/results/"
         params = {
@@ -436,7 +535,7 @@ def check_steam_discounts():
 
         discounted_games = unique_games[:10]
 
-        print(f"\n📊 ВСЕГО НАЙДЕНО: {len(discounted_games)} игр со скидкой 90%+")
+        print(f"\n📊 ВСЕГО НАЙДЕНО: {len(discounted_games)} игр со скидкой 80%+")
 
     except Exception as e:
         print(f"❌ Ошибка при проверке скидок Steam: {e}")
@@ -608,7 +707,7 @@ async def cmd_test_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 <b>Результаты парсинга:</b>\n\n"
         f"🎮 Steam бесплатные: {len(steam_free)}\n"
         f"🎯 Epic бесплатные: {len(epic_games)}\n"
-        f"🔥 Скидки 90%+: {len(discounts)}"
+        f"🔥 Скидки 80%+: {len(discounts)}"
     )
 
     if steam_free:
@@ -660,28 +759,111 @@ async def broadcast_message(bot, text, parse_mode='HTML'):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start - Подписаться и показать текущие предложения"""
+    """Команда /start - Начало работы с ботом (требует подписки на канал)"""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    # Проверяем, уже подписан ли пользователь на рассылку
+    users = load_users()
+    if chat_id in users["users"]:
+        # Если уже подписан, показываем текущие предложения
+        await update.message.reply_text(
+            "✅ Вы уже подписаны на рассылку!\n\n"
+            "⏳ <i>Загружаю текущие предложения...</i>",
+            parse_mode='HTML'
+        )
+        await asyncio.sleep(1)
+        await show_current_deals(update, context)
+        return
+
+    # Создаем URL для подписки на канал
+    channel_url = f"https://t.me/{MAIN_CHANNEL_ID.replace('@', '')}" if MAIN_CHANNEL_ID.startswith(
+        '@') else MAIN_CHANNEL_ID
+
+    # Показываем сообщение с требованием подписаться на канал
+    keyboard = [
+        [InlineKeyboardButton("📢 Подписаться на канал", url=channel_url)],
+        [InlineKeyboardButton("✅ Я подписался", callback_data="check_subscription")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "👋 <b>Привет! Я бот для отслеживания бесплатных игр!</b>\n\n"
+        "🎮 Я мониторю раздачи в:\n"
+        "• Steam\n"
+        "• Epic Games Store\n\n"
+        "⚠️ <b>Но сначала нужно подписаться на наш основной канал!</b>\n\n"
+        "👇 Нажми кнопку ниже, чтобы подписаться, а затем нажми «Я подписался»",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+    # Добавляем пользователя в список ожидающих
+    add_pending_user(chat_id, user.username, user.first_name)
+
+
+async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия кнопки 'Я подписался'"""
+    query = update.callback_query
+    await query.answer()
+
     chat_id = update.effective_chat.id
 
-    if add_user(chat_id):
-        await update.message.reply_text(
-            "✅ <b>Подписка оформлена!</b> 🎮\n\n"
-            "Я буду уведомлять тебя о новых бесплатных играх и больших скидках в:\n"
-            "• Steam\n"
-            "• Epic Games Store\n\n"
-            "⏳ <i>Загружаю текущие предложения...</i>",
+    # Проверяем, ожидает ли пользователь подтверждения
+    if not check_pending_user(chat_id):
+        await query.edit_message_text(
+            "❌ Время ожидания истекло. Пожалуйста, введите /start заново.",
             parse_mode='HTML'
         )
-    else:
-        await update.message.reply_text(
-            "ℹ️ Ты уже подписан на уведомления.\n\n"
+        return
+
+    # Отправляем сообщение о проверке
+    await query.edit_message_text(
+        "🔄 Проверяю подписку на канал...",
+        parse_mode='HTML'
+    )
+
+    # Проверяем подписку на канал
+    is_subscribed = await check_channel_subscription(context.bot, chat_id, MAIN_CHANNEL_ID)
+
+    if is_subscribed:
+        # Подписываем пользователя на рассылку
+        add_user(chat_id)
+
+        await query.edit_message_text(
+            "✅ <b>Подписка оформлена!</b> 🎮\n\n"
+            "Спасибо за подписку на наш канал!\n"
+            "Теперь вы будете получать уведомления о:\n"
+            "• Бесплатных играх в Steam и Epic Games\n"
+            "• Огромных скидках 80%+ в Steam\n\n"
             "⏳ <i>Загружаю текущие предложения...</i>",
             parse_mode='HTML'
         )
 
-    # Показываем текущие раздачи
-    await asyncio.sleep(1)
-    await show_current_deals(update, context)
+        # Показываем текущие раздачи
+        await asyncio.sleep(1)
+        await show_current_deals(update, context)
+    else:
+        # Если не подписан, показываем сообщение об ошибке с диагностикой
+        channel_url = f"https://t.me/{MAIN_CHANNEL_ID.replace('@', '')}" if MAIN_CHANNEL_ID.startswith(
+            '@') else MAIN_CHANNEL_ID
+
+        keyboard = [
+            [InlineKeyboardButton("📢 Подписаться на канал", url=channel_url)],
+            [InlineKeyboardButton("✅ Я подписался", callback_data="check_subscription")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            "❌ <b>Вы не подписаны на канал!</b>\n\n"
+            "Пожалуйста, убедитесь что:\n"
+            "1. Вы нажали на кнопку и подписались на канал\n"
+            "2. Подписка активна (не отменена)\n"
+            "3. После подписки снова нажмите «Я подписался»\n\n"
+            "Если вы уверены, что подписаны, возможно бот еще не добавлен в администраторы канала.",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -710,13 +892,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Что я делаю:</b>\n"
         "• Автоматически проверяю новые раздачи КАЖДЫЙ ЧАС\n"
         "• Мгновенно присылаю уведомления о бесплатных играх\n"
-        "• Ищу скидки 90% и выше в Steam\n\n"
+        "• Ищу скидки 80% и выше в Steam\n\n"
         "<b>Команды:</b>\n"
-        "/start - Подписаться на уведомления\n"
+        "/start - Подписаться на уведомления (требуется подписка на канал)\n"
         "/stop - Отписаться от уведомлений\n"
         "/myid - Узнать свой Telegram ID\n"
         "/help - Показать это сообщение\n\n"
-        "✅ <b>Подписывайся и получай игры бесплатно!</b>",
+        "✅ <b>Подписывайся на канал и получай игры бесплатно!</b>",
         parse_mode='HTML'
     )
 
@@ -791,11 +973,11 @@ async def show_current_deals(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Проверяем скидки Steam
     await send_func("🔥 <b>Проверяю большие скидки в Steam...</b>", parse_mode='HTML')
     discounts = check_steam_discounts()
-    print(f"🔍 Найдено скидок 90%+ в Steam: {len(discounts)}")
+    print(f"🔍 Найдено скидок 80%+ в Steam: {len(discounts)}")
 
     if discounts:
         await send_func(
-            "🔥 <b>Огромные скидки в Steam (90%+):</b>",
+            "🔥 <b>Огромные скидки в Steam (80%+):</b>",
             parse_mode='HTML'
         )
 
@@ -853,7 +1035,7 @@ async def send_notification_to_all(bot, game_info, game_type='free'):
                 disable_web_page_preview=False
             )
             success_count += 1
-            if success_count % 10 == 0:  # Каждые 10 отправок
+            if success_count % 10 == 0:
                 print(f"   Отправлено {success_count}/{len(users['users'])}")
             await asyncio.sleep(0.05)
         except TelegramError as e:
@@ -895,19 +1077,25 @@ async def bot_listener():
     """Задача 1: Слушает команды пользователей"""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("testparse", cmd_test_parsing))
+    app.add_handler(CommandHandler("checksub", cmd_check_sub))  # Новая диагностическая команда
+
+    # Добавляем обработчик callback-запросов
+    app.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
 
     await app.initialize()
     await app.start()
 
     print("🎧 Бот слушает команды пользователей...")
     print(f"👑 Админ ID: {YOUR_ADMIN_ID}")
-    print("📋 Доступные команды: /start, /stop, /help, /myid, /broadcast, /testparse\n")
+    print(f"📢 Основной канал: {MAIN_CHANNEL_ID}")
+    print("📋 Доступные команды: /start, /stop, /help, /myid, /broadcast, /testparse, /checksub\n")
 
     await app.updater.start_polling()
 
@@ -1039,7 +1227,8 @@ async def main():
     print(f"⏱️  Интервал проверки: {CHECK_INTERVAL // 60} минут")
     print(f"📁 Файл пользователей: {USERS_FILE}")
     print(f"📁 Файл настроек: {USER_SETTINGS_FILE}")
-    print(f"📁 Файл игр: {NOTIFIED_GAMES_FILE}\n")
+    print(f"📁 Файл игр: {NOTIFIED_GAMES_FILE}")
+    print(f"📁 Файл ожидающих: {PENDING_USERS_FILE}\n")
     print("💡 Нажми Ctrl+C для остановки бота\n")
 
     try:
